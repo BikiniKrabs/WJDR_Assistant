@@ -8,13 +8,24 @@ import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.media.Image
 import android.media.ImageReader
+import android.media.projection.MediaProjection
 import android.os.Build
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.ImageButton
+import android.widget.LinearLayout
 import androidx.annotation.RequiresApi
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
 import java.io.FileOutputStream
 
@@ -29,23 +40,42 @@ class AccessibilityControlService : AccessibilityService() {
     companion object {
         private const val TAG = "AccessibilityControlService"
         private var instance: AccessibilityControlService? = null
+        private var mediaProjection: MediaProjection? = null
 
         fun getInstance(): AccessibilityControlService? = instance
+
+        fun setMediaProjection(projection: MediaProjection?) {
+            mediaProjection = projection
+        }
+
+        fun hasMediaProjection(): Boolean = mediaProjection != null
     }
 
     private var screenshotCallback: ScreenshotCallback? = null
     private var displayMetrics: DisplayMetrics? = null
 
+    // 浮窗相关
+    private var windowManager: WindowManager? = null
+    private var overlayView: View? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
+    private var isRunning = false
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         displayMetrics = resources.displayMetrics
-        Log.d(TAG, "无障碍服务已连接")
+
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        showFloatingControls()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        mediaProjection?.stop()
+        mediaProjection = null
+
+        removeFloatingControls()
         Log.d(TAG, "无障碍服务已销毁")
     }
 
@@ -112,8 +142,199 @@ class AccessibilityControlService : AccessibilityService() {
         takeScreenshotWithImageReader()
     }
 
+    private fun showFloatingControls() {
+        if (overlayView != null || windowManager == null) return
+
+        val layout = LayoutInflater.from(this).inflate(R.layout.overlay_controls, null) as LinearLayout
+        val btnStartPause = layout.findViewById<ImageButton>(R.id.btn_start_pause)
+        val btnStop = layout.findViewById<ImageButton>(R.id.btn_stop)
+        val btnSettings = layout.findViewById<ImageButton>(R.id.btn_settings)
+        val btnMove = layout.findViewById<ImageButton>(R.id.btn_move)
+
+        // 拖动浮窗
+        var lastX = 0f
+        var lastY = 0f
+        var paramX = 0
+        var paramY = 0
+        layout.setOnTouchListener { _, event ->
+            val params = overlayParams ?: return@setOnTouchListener false
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastX = event.rawX
+                    lastY = event.rawY
+                    paramX = params.x
+                    paramY = params.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - lastX).toInt()
+                    val dy = (event.rawY - lastY).toInt()
+                    params.x = paramX + dx
+                    params.y = paramY + dy
+                    windowManager?.updateViewLayout(layout, params)
+                    true
+                }
+                else -> false
+            }
+        }
+
+        btnStartPause.setOnClickListener {
+            startOneShotScreenshotSaveAndOcr(btnStartPause)
+        }
+
+        btnStop.setOnClickListener {
+            isRunning = false
+            btnStartPause.setImageResource(android.R.drawable.ic_media_play)
+            removeFloatingControls()
+        }
+
+        btnSettings.setOnClickListener {
+            try {
+                val intent = android.content.Intent(this, MainActivity::class.java).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "启动设置界面失败", e)
+            }
+        }
+
+        btnMove.setOnClickListener {
+            // 仅保留占位（拖动已绑定在整个 layout 上）
+        }
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 100
+            y = 300
+        }
+
+        overlayParams = params
+        overlayView = layout
+        windowManager?.addView(layout, params)
+    }
+
+    private fun removeFloatingControls() {
+        try {
+            overlayView?.let { view -> windowManager?.removeView(view) }
+        } catch (e: Exception) {
+            Log.e(TAG, "移除浮窗失败", e)
+        } finally {
+            overlayView = null
+            overlayParams = null
+        }
+    }
+
+    /**
+     * 点击开始：图标切换为暂停 -> 截图保存 -> 对指定区域 OCR -> 保存 txt
+     */
+    private fun startOneShotScreenshotSaveAndOcr(btnStartPause: ImageButton) {
+        if (isRunning) return
+        isRunning = true
+
+        btnStartPause.post {
+            btnStartPause.setImageResource(android.R.drawable.ic_media_pause)
+            btnStartPause.invalidate()
+        }
+
+        if (!hasMediaProjection()) {
+            // 引导去主界面授权
+            try {
+                val intent = android.content.Intent(this, MainActivity::class.java).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra(MainActivity.EXTRA_REQUEST_MEDIA_PROJECTION, true)
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "启动主界面申请屏幕捕获权限失败", e)
+            } finally {
+                finishStart(btnStartPause)
+            }
+            return
+        }
+
+        takeScreenshot(object : ScreenshotCallback {
+            override fun onScreenshotTaken(bitmap: Bitmap?) {
+                if (bitmap == null) {
+                    finishStart(btnStartPause)
+                    return
+                }
+
+                val outDir = getExternalFilesDir(null) ?: filesDir
+                val baseName = "overlay_${System.currentTimeMillis()}"
+                val imgFile = File(outDir, "$baseName.png")
+                saveScreenshotToFile(bitmap, imgFile.absolutePath)
+
+                // OCR：默认识别上方 20% 高度、左右各留 10% 边距的区域
+                val ocrTextFile = File(outDir, "$baseName.txt")
+                val crop = cropForOcr(bitmap)
+                val image = InputImage.fromBitmap(crop, 0)
+                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                recognizer.process(image)
+                    .addOnSuccessListener { result ->
+                        try {
+                            ocrTextFile.writeText(result.text ?: "")
+                        } catch (e: Exception) {
+                            Log.e(TAG, "写入 OCR 文本失败", e)
+                        } finally {
+                            finishStart(btnStartPause)
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e(TAG, "OCR 失败", e)
+                        try {
+                            ocrTextFile.writeText("")
+                        } catch (_: Exception) {
+                        } finally {
+                            finishStart(btnStartPause)
+                        }
+                    }
+            }
+
+            override fun onScreenshotError(error: String) {
+                finishStart(btnStartPause)
+            }
+        })
+    }
+
+    private fun finishStart(btnStartPause: ImageButton) {
+        isRunning = false
+        btnStartPause.postDelayed({
+            btnStartPause.setImageResource(android.R.drawable.ic_media_play)
+            btnStartPause.invalidate()
+        }, 300)
+    }
+
+    private fun cropForOcr(bitmap: Bitmap): Bitmap {
+        val w = bitmap.width
+        val h = bitmap.height
+        val left = (w * 0.10f).toInt().coerceIn(0, w - 1)
+        val top = (h * 0.05f).toInt().coerceIn(0, h - 1)
+        val right = (w * 0.90f).toInt().coerceIn(left + 1, w)
+        val bottom = (h * 0.25f).toInt().coerceIn(top + 1, h)
+        return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+    }
+
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
     private fun takeScreenshotWithImageReader() {
+        val projection = mediaProjection
+        if (projection == null) {
+            screenshotCallback?.onScreenshotError("需要先授予屏幕捕获权限")
+            return
+        }
         var imageReader: ImageReader? = null
         var virtualDisplay: android.hardware.display.VirtualDisplay? = null
         
@@ -136,24 +357,18 @@ class AccessibilityControlService : AccessibilityService() {
             )
 
             val surface = imageReader.surface
-            
-            // 创建虚拟显示用于截图
-            // 注意：某些设备可能不允许无障碍服务创建虚拟显示
-            virtualDisplay = try {
-                displayManager.createVirtualDisplay(
-                    "Screenshot_${System.currentTimeMillis()}",
-                    metrics.widthPixels,
-                    metrics.heightPixels,
-                    metrics.densityDpi,
-                    surface,
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "创建虚拟显示失败", e)
-                screenshotCallback?.onScreenshotError("无法创建虚拟显示: ${e.message}")
-                imageReader?.close()
-                return
-            }
+
+            // 使用 MediaProjection 创建虚拟显示（Android 14+ 必需）
+            virtualDisplay = projection.createVirtualDisplay(
+                "Screenshot_${System.currentTimeMillis()}",
+                metrics.widthPixels,
+                metrics.heightPixels,
+                metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                surface,
+                null,
+                null
+            )
 
             if (virtualDisplay == null) {
                 screenshotCallback?.onScreenshotError("无法创建虚拟显示，可能需要系统权限")

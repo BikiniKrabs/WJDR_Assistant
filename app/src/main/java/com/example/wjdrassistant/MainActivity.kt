@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.Bundle
+import android.media.projection.MediaProjectionManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
 import android.widget.Toast
@@ -31,6 +32,10 @@ import com.example.wjdrassistant.ui.theme.WJDRAssistantTheme
 import java.io.File
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        const val EXTRA_REQUEST_MEDIA_PROJECTION = "extra_request_media_projection"
+    }
     
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -41,6 +46,22 @@ class MainActivity : ComponentActivity() {
         } else {
             Toast.makeText(this, "需要存储权限才能保存截图", Toast.LENGTH_LONG).show()
         }
+    }
+
+    private var pendingMediaProjectionAction: (() -> Unit)? = null
+    private val mediaProjectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val projection = manager.getMediaProjection(result.resultCode, data)
+            AccessibilityControlService.setMediaProjection(projection)
+            pendingMediaProjectionAction?.invoke()
+        } else {
+            Toast.makeText(this, "需要授予屏幕捕获权限才能截图/OCR", Toast.LENGTH_LONG).show()
+        }
+        pendingMediaProjectionAction = null
     }
     
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -57,6 +78,10 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+
+        if (intent?.getBooleanExtra(EXTRA_REQUEST_MEDIA_PROJECTION, false) == true) {
+            ensureMediaProjectionPermission {}
         }
     }
     
@@ -95,6 +120,18 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.WRITE_EXTERNAL_STORAGE
             ) == PackageManager.PERMISSION_GRANTED
         }
+    }
+
+    fun ensureMediaProjectionPermission(onReady: () -> Unit) {
+        if (AccessibilityControlService.hasMediaProjection()) {
+            onReady()
+            return
+        }
+        // Android 14+ 要求在申请 MediaProjection 前必须有 mediaProjection 类型前台服务
+        ScreenCaptureForegroundService.start(this)
+        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        pendingMediaProjectionAction = onReady
+        mediaProjectionLauncher.launch(manager.createScreenCaptureIntent())
     }
 }
 
@@ -207,26 +244,28 @@ fun AccessibilityControlScreen(
                             val service = AccessibilityControlService.getInstance()
                             if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                                 Toast.makeText(context, "正在截图...", Toast.LENGTH_SHORT).show()
-                                service.takeScreenshot(object : AccessibilityControlService.ScreenshotCallback {
-                                    override fun onScreenshotTaken(bitmap: Bitmap?) {
-                                        if (bitmap != null) {
-                                            screenshotBitmap = bitmap
-                                            // 保存截图到应用私有目录（不需要权限）
-                                            val file = File(context.getExternalFilesDir(null), "screenshot_${System.currentTimeMillis()}.png")
-                                            if (service.saveScreenshotToFile(bitmap, file.absolutePath)) {
-                                                Toast.makeText(context, "截图已保存: ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                                activity?.ensureMediaProjectionPermission {
+                                    service.takeScreenshot(object : AccessibilityControlService.ScreenshotCallback {
+                                        override fun onScreenshotTaken(bitmap: Bitmap?) {
+                                            if (bitmap != null) {
+                                                screenshotBitmap = bitmap
+                                                // 保存截图到应用私有目录（不需要权限）
+                                                val file = File(context.getExternalFilesDir(null), "screenshot_${System.currentTimeMillis()}.png")
+                                                if (service.saveScreenshotToFile(bitmap, file.absolutePath)) {
+                                                    Toast.makeText(context, "截图已保存: ${file.absolutePath}", Toast.LENGTH_LONG).show()
+                                                } else {
+                                                    Toast.makeText(context, "截图成功但保存失败", Toast.LENGTH_SHORT).show()
+                                                }
                                             } else {
-                                                Toast.makeText(context, "截图成功但保存失败", Toast.LENGTH_SHORT).show()
+                                                Toast.makeText(context, "截图返回为空", Toast.LENGTH_SHORT).show()
                                             }
-                                        } else {
-                                            Toast.makeText(context, "截图返回为空", Toast.LENGTH_SHORT).show()
                                         }
-                                    }
 
-                                    override fun onScreenshotError(error: String) {
-                                        Toast.makeText(context, "截图失败: $error", Toast.LENGTH_SHORT).show()
-                                    }
-                                })
+                                        override fun onScreenshotError(error: String) {
+                                            Toast.makeText(context, "截图失败: $error", Toast.LENGTH_SHORT).show()
+                                        }
+                                    })
+                                }
                             } else {
                                 Toast.makeText(context, "服务不可用或系统版本不支持", Toast.LENGTH_SHORT).show()
                             }
