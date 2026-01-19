@@ -6,29 +6,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
-import android.media.projection.MediaProjectionManager
 import android.provider.Settings
 import android.view.accessibility.AccessibilityManager
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.unit.dp
-import com.example.wjdrassistant.ui.theme.WJDRAssistantTheme
 import java.io.File
 
 class MainActivity : ComponentActivity() {
@@ -67,24 +56,52 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        setContent {
-            WJDRAssistantTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    AccessibilityControlScreen(
-                        requestPermissions = { requestStoragePermissions() }
-                    )
-                }
+        setContentView(R.layout.activity_main)
+
+        val tvStatus = findViewById<TextView>(R.id.tv_status)
+        val tvResult = findViewById<TextView>(R.id.tv_result)
+        val btnGoAccessibility = findViewById<Button>(R.id.btn_go_accessibility)
+        val btnStartAssistant = findViewById<Button>(R.id.btn_start_assistant)
+
+        fun refreshStatus() {
+            val enabled = isAccessibilityServiceEnabled(this)
+            tvStatus.text = if (enabled) "服务已启用" else "服务未启用"
+        }
+        refreshStatus()
+
+        btnGoAccessibility.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+
+        btnStartAssistant.setOnClickListener {
+            if (!isAccessibilityServiceEnabled(this)) {
+                Toast.makeText(this, "请先在无障碍设置中启用助手服务", Toast.LENGTH_SHORT).show()
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                return@setOnClickListener
             }
+            // 助手实际上由无障碍服务 + 浮窗实现，这里只做提示
+            tvResult.text = "结果：助手已启动，可通过屏幕浮窗开始/暂停"
+            launchApp("com.gof.china")
         }
 
         if (intent?.getBooleanExtra(EXTRA_REQUEST_MEDIA_PROJECTION, false) == true) {
             ensureMediaProjectionPermission {}
         }
     }
-    
+
+    fun launchApp(packageName: String) {
+        val packageManager: PackageManager = this.packageManager
+        var intent: Intent? = packageManager.getLaunchIntentForPackage(packageName)
+
+        if (intent != null) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+        } else {
+            Toast.makeText(this, "Application not found or cannot be launched.", Toast.LENGTH_SHORT)
+                .show()
+        }
+    }
+
     private fun requestStoragePermissions() {
         val permissions = mutableListOf<String>()
         
@@ -135,411 +152,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun AccessibilityControlScreen(
-    requestPermissions: () -> Unit = {}
-) {
-    val context = LocalContext.current
-    val activity = context as? MainActivity
-    var isServiceEnabled by remember { mutableStateOf(isAccessibilityServiceEnabled(context)) }
-    var screenshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
-    
-    // 点击坐标
-    var clickX by remember { mutableStateOf("") }
-    var clickY by remember { mutableStateOf("") }
-    
-    // 滑动坐标
-    var swipeStartX by remember { mutableStateOf("") }
-    var swipeStartY by remember { mutableStateOf("") }
-    var swipeEndX by remember { mutableStateOf("") }
-    var swipeEndY by remember { mutableStateOf("") }
-    
-    // 长按坐标
-    var longClickX by remember { mutableStateOf("") }
-    var longClickY by remember { mutableStateOf("") }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-            .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(
-            text = "无障碍控制助手",
-            style = MaterialTheme.typography.headlineMedium
-        )
-
-        // 服务状态
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = if (isServiceEnabled) 
-                    MaterialTheme.colorScheme.primaryContainer 
-                else 
-                    MaterialTheme.colorScheme.errorContainer
-            )
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = if (isServiceEnabled) "服务已启用" else "服务未启用",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        context.startActivity(intent)
-                    }
-                ) {
-                    Text("前往设置")
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        isServiceEnabled = isAccessibilityServiceEnabled(context)
-                    }
-                ) {
-                    Text("刷新状态")
-                }
-            }
-        }
-
-        if (!isServiceEnabled) {
-            Text(
-                text = "请先启用无障碍服务才能使用以下功能",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error
-            )
-        }
-
-        // 截图功能
-        Card(
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "截图功能",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        if (isServiceEnabled) {
-                            // 检查存储权限
-                            if (activity?.hasStoragePermission() != true) {
-                                Toast.makeText(context, "需要存储权限才能保存截图，正在请求权限...", Toast.LENGTH_SHORT).show()
-                                requestPermissions()
-                                return@Button
-                            }
-                            
-                            val service = AccessibilityControlService.getInstance()
-                            if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                                Toast.makeText(context, "正在截图...", Toast.LENGTH_SHORT).show()
-                                activity?.ensureMediaProjectionPermission {
-                                    service.takeScreenshot(object : AccessibilityControlService.ScreenshotCallback {
-                                        override fun onScreenshotTaken(bitmap: Bitmap?) {
-                                            if (bitmap != null) {
-                                                screenshotBitmap = bitmap
-                                                // 保存截图到应用私有目录（不需要权限）
-                                                val file = File(context.getExternalFilesDir(null), "screenshot_${System.currentTimeMillis()}.png")
-                                                if (service.saveScreenshotToFile(bitmap, file.absolutePath)) {
-                                                    Toast.makeText(context, "截图已保存: ${file.absolutePath}", Toast.LENGTH_LONG).show()
-                                                } else {
-                                                    Toast.makeText(context, "截图成功但保存失败", Toast.LENGTH_SHORT).show()
-                                                }
-                                            } else {
-                                                Toast.makeText(context, "截图返回为空", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-
-                                        override fun onScreenshotError(error: String) {
-                                            Toast.makeText(context, "截图失败: $error", Toast.LENGTH_SHORT).show()
-                                        }
-                                    })
-                                }
-                            } else {
-                                Toast.makeText(context, "服务不可用或系统版本不支持", Toast.LENGTH_SHORT).show()
-                            }
-                        } else {
-                            Toast.makeText(context, "请先启用无障碍服务", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    enabled = isServiceEnabled
-                ) {
-                    Text("截图")
-                }
-                if (screenshotBitmap != null) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "截图尺寸: ${screenshotBitmap!!.width} x ${screenshotBitmap!!.height}",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-            }
-        }
-
-        // 点击功能
-        Card(
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp)
-            ) {
-                Text(
-                    text = "点击功能",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = clickX,
-                        onValueChange = { clickX = it },
-                        label = { Text("X坐标") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = clickY,
-                        onValueChange = { clickY = it },
-                        label = { Text("Y坐标") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        if (isServiceEnabled) {
-                            val x = clickX.toFloatOrNull()
-                            val y = clickY.toFloatOrNull()
-                            if (x != null && y != null) {
-                                val service = AccessibilityControlService.getInstance()
-                                if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                    service.click(x, y, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {
-                                        override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "点击完成", Toast.LENGTH_SHORT).show()
-                                        }
-
-                                        override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "点击取消", Toast.LENGTH_SHORT).show()
-                                        }
-                                    })
-                                } else {
-                                    Toast.makeText(context, "服务不可用或系统版本不支持", Toast.LENGTH_SHORT).show()
-                                }
-                            } else {
-                                Toast.makeText(context, "请输入有效的坐标", Toast.LENGTH_SHORT).show()
-                            }
-                        } else {
-                            Toast.makeText(context, "请先启用无障碍服务", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = isServiceEnabled
-                ) {
-                    Text("执行点击")
-                }
-            }
-        }
-
-        // 长按功能
-        Card(
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp)
-            ) {
-                Text(
-                    text = "长按功能",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = longClickX,
-                        onValueChange = { longClickX = it },
-                        label = { Text("X坐标") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = longClickY,
-                        onValueChange = { longClickY = it },
-                        label = { Text("Y坐标") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        if (isServiceEnabled) {
-                            val x = longClickX.toFloatOrNull()
-                            val y = longClickY.toFloatOrNull()
-                            if (x != null && y != null) {
-                                val service = AccessibilityControlService.getInstance()
-                                if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                    service.longClick(x, y, 500, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {
-                                        override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "长按完成", Toast.LENGTH_SHORT).show()
-                                        }
-
-                                        override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "长按取消", Toast.LENGTH_SHORT).show()
-                                        }
-                                    })
-                                } else {
-                                    Toast.makeText(context, "服务不可用或系统版本不支持", Toast.LENGTH_SHORT).show()
-                                }
-                            } else {
-                                Toast.makeText(context, "请输入有效的坐标", Toast.LENGTH_SHORT).show()
-                            }
-                        } else {
-                            Toast.makeText(context, "请先启用无障碍服务", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = isServiceEnabled
-                ) {
-                    Text("执行长按")
-                }
-            }
-        }
-
-        // 滑动功能
-        Card(
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp)
-            ) {
-                Text(
-                    text = "滑动功能",
-                    style = MaterialTheme.typography.titleLarge
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "起始坐标",
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = swipeStartX,
-                        onValueChange = { swipeStartX = it },
-                        label = { Text("X") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = swipeStartY,
-                        onValueChange = { swipeStartY = it },
-                        label = { Text("Y") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "结束坐标",
-                    style = MaterialTheme.typography.labelMedium
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = swipeEndX,
-                        onValueChange = { swipeEndX = it },
-                        label = { Text("X") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                    OutlinedTextField(
-                        value = swipeEndY,
-                        onValueChange = { swipeEndY = it },
-                        label = { Text("Y") },
-                        modifier = Modifier.weight(1f),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        singleLine = true
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        if (isServiceEnabled) {
-                            val startX = swipeStartX.toFloatOrNull()
-                            val startY = swipeStartY.toFloatOrNull()
-                            val endX = swipeEndX.toFloatOrNull()
-                            val endY = swipeEndY.toFloatOrNull()
-                            if (startX != null && startY != null && endX != null && endY != null) {
-                                val service = AccessibilityControlService.getInstance()
-                                if (service != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                    service.swipe(startX, startY, endX, endY, 300, object : android.accessibilityservice.AccessibilityService.GestureResultCallback() {
-                                        override fun onCompleted(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "滑动完成", Toast.LENGTH_SHORT).show()
-                                        }
-
-                                        override fun onCancelled(gestureDescription: android.accessibilityservice.GestureDescription?) {
-                                            Toast.makeText(context, "滑动取消", Toast.LENGTH_SHORT).show()
-                                        }
-                                    })
-                                } else {
-                                    Toast.makeText(context, "服务不可用或系统版本不支持", Toast.LENGTH_SHORT).show()
-                                }
-                            } else {
-                                Toast.makeText(context, "请输入有效的坐标", Toast.LENGTH_SHORT).show()
-                            }
-                        } else {
-                            Toast.makeText(context, "请先启用无障碍服务", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = isServiceEnabled
-                ) {
-                    Text("执行滑动")
-                }
-            }
-        }
-    }
-}
-
 fun isAccessibilityServiceEnabled(context: Context): Boolean {
     val accessibilityManager = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
     val enabledServices = accessibilityManager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-    
     for (service in enabledServices) {
-        if (service.resolveInfo.serviceInfo.packageName == context.packageName) {
-            return true
-        }
+        if (service.resolveInfo.serviceInfo.packageName == context.packageName) return true
     }
     return false
 }

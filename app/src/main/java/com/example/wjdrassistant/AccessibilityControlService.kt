@@ -151,33 +151,6 @@ class AccessibilityControlService : AccessibilityService() {
         val btnSettings = layout.findViewById<ImageButton>(R.id.btn_settings)
         val btnMove = layout.findViewById<ImageButton>(R.id.btn_move)
 
-        // 拖动浮窗
-        var lastX = 0f
-        var lastY = 0f
-        var paramX = 0
-        var paramY = 0
-        layout.setOnTouchListener { _, event ->
-            val params = overlayParams ?: return@setOnTouchListener false
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    lastX = event.rawX
-                    lastY = event.rawY
-                    paramX = params.x
-                    paramY = params.y
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = (event.rawX - lastX).toInt()
-                    val dy = (event.rawY - lastY).toInt()
-                    params.x = paramX + dx
-                    params.y = paramY + dy
-                    windowManager?.updateViewLayout(layout, params)
-                    true
-                }
-                else -> false
-            }
-        }
-
         btnStartPause.setOnClickListener {
             startOneShotScreenshotSaveAndOcr(btnStartPause)
         }
@@ -199,8 +172,32 @@ class AccessibilityControlService : AccessibilityService() {
             }
         }
 
-        btnMove.setOnClickListener {
-            // 仅保留占位（拖动已绑定在整个 layout 上）
+        // 第四个按钮：按住拖动浮窗
+        var lastX = 0f
+        var lastY = 0f
+        var paramX = 0
+        var paramY = 0
+        btnMove.setOnTouchListener { _, event ->
+            val params = overlayParams ?: return@setOnTouchListener false
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastX = event.rawX
+                    lastY = event.rawY
+                    paramX = params.x
+                    paramY = params.y
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (event.rawX - lastX).toInt()
+                    val dy = (event.rawY - lastY).toInt()
+                    params.x = paramX + dx
+                    params.y = paramY + dy
+                    windowManager?.updateViewLayout(layout, params)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
+                else -> false
+            }
         }
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
