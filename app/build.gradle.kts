@@ -52,6 +52,8 @@ dependencies {
     implementation(libs.androidx.viewfinder.core)
     // OCR
     implementation("com.google.mlkit:text-recognition:16.0.0")
+    // OpenCV (template matching)
+    implementation("org.opencv:opencv:4.9.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

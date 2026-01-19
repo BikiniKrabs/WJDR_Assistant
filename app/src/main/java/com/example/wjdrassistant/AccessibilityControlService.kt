@@ -26,14 +26,24 @@ import androidx.annotation.RequiresApi
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.Point
+import org.opencv.core.Rect
+import org.opencv.core.Scalar
+import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.io.FileOutputStream
+import java.lang.ref.WeakReference
 
 class AccessibilityControlService : AccessibilityService() {
 
     // 回调接口
     interface ScreenshotCallback {
-        fun onScreenshotTaken(bitmap: Bitmap?)
+        fun onScreenshotTaken(bitmap: Bitmap?, searchMapName: String)
         fun onScreenshotError(error: String)
     }
 
@@ -59,11 +69,21 @@ class AccessibilityControlService : AccessibilityService() {
     private var overlayView: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private var isRunning = false
+    private var isScanning = false
+    private var startBtnRef: WeakReference<ImageButton>? = null
+    private val scanHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var scanRunnable: Runnable? = null
+    private var delayedStartRunnable: Runnable? = null
+    private val matchThreshold = 0.80 // 0~1，越大越严格
+    private val scanIntervalMs = 1000L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         displayMetrics = resources.displayMetrics
+
+        // 初始化 OpenCV
+        OpenCVLoader.initDebug()
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         showFloatingControls()
@@ -93,7 +113,7 @@ class AccessibilityControlService : AccessibilityService() {
      * 因此直接使用 ImageReader + VirtualDisplay 方式，兼容性更好
      */
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-    fun takeScreenshot(callback: ScreenshotCallback) {
+    fun takeScreenshot(callback: ScreenshotCallback, templateName: String = "template.png") {
         this.screenshotCallback = callback
         
         // 直接使用 ImageReader 方式，因为某些系统不允许服务使用 takeScreenshot API
@@ -113,19 +133,19 @@ class AccessibilityControlService : AccessibilityService() {
                                         screenshot.colorSpace
                                     )
                                     screenshot.hardwareBuffer.close()
-                                    screenshotCallback?.onScreenshotTaken(bitmap)
+                                    screenshotCallback?.onScreenshotTaken(bitmap, templateName)
                                 } else {
-                                    takeScreenshotWithImageReader()
+                                    takeScreenshotWithImageReader(templateName)
                                 }
                             } catch (e: Exception) {
                                 Log.e(TAG, "处理截图失败，回退到ImageReader方式", e)
-                                takeScreenshotWithImageReader()
+                                takeScreenshotWithImageReader(templateName)
                             }
                         }
 
                         override fun onFailure(errorCode: Int) {
                             Log.e(TAG, "takeScreenshot失败，错误代码: $errorCode，使用ImageReader方式")
-                            takeScreenshotWithImageReader()
+                            takeScreenshotWithImageReader(templateName)
                         }
                     }
                 )
@@ -139,7 +159,7 @@ class AccessibilityControlService : AccessibilityService() {
         */
         
         // 使用 ImageReader 方式
-        takeScreenshotWithImageReader()
+        takeScreenshotWithImageReader(templateName)
     }
 
     private fun showFloatingControls() {
@@ -150,14 +170,16 @@ class AccessibilityControlService : AccessibilityService() {
         val btnStop = layout.findViewById<ImageButton>(R.id.btn_stop)
         val btnSettings = layout.findViewById<ImageButton>(R.id.btn_settings)
         val btnMove = layout.findViewById<ImageButton>(R.id.btn_move)
+        startBtnRef = WeakReference(btnStartPause)
 
         btnStartPause.setOnClickListener {
-            startOneShotScreenshotSaveAndOcr(btnStartPause)
+            toggleStartPause()
         }
 
         btnStop.setOnClickListener {
             isRunning = false
             btnStartPause.setImageResource(android.R.drawable.ic_media_play)
+            cancelScan()
             removeFloatingControls()
         }
 
@@ -264,7 +286,7 @@ class AccessibilityControlService : AccessibilityService() {
         }
 
         takeScreenshot(object : ScreenshotCallback {
-            override fun onScreenshotTaken(bitmap: Bitmap?) {
+            override fun onScreenshotTaken(bitmap: Bitmap?, searchMapName: String) {
                 if (bitmap == null) {
                     finishStart(btnStartPause)
                     return
@@ -307,6 +329,203 @@ class AccessibilityControlService : AccessibilityService() {
         })
     }
 
+    /**
+     * 浮窗开始/暂停：
+     * - 点开始：图标变暂停，立即开始循环截图 -> OpenCV 模板匹配 -> 找到即点击并停止
+     * - 点暂停：停止循环
+     */
+    private fun toggleStartPause() {
+        if (!isRunning) {
+            isRunning = true
+            updateStartIcon(running = true)
+            // 立即开始扫描
+            startScanLoop()
+        } else {
+            // 暂停
+            isRunning = false
+            updateStartIcon(running = false)
+            cancelScan()
+        }
+    }
+
+    private fun updateStartIcon(running: Boolean) {
+        val btn = startBtnRef?.get() ?: return
+        btn.post {
+            btn.setImageResource(if (running) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play)
+            btn.invalidate()
+        }
+    }
+
+    private fun startScanLoop() {
+        if (!isRunning) return
+        cancelScan()
+
+        scanRunnable = object : Runnable {
+            override fun run() {
+                if (!isRunning) return
+                if (isScanning) {
+                    scanHandler.postDelayed(this, scanIntervalMs)
+                    return
+                }
+                isScanning = true
+                captureAndMatchOnce(
+                    onFound = {
+                        // 找到就点击并停止
+                        Log.e("ss", "zaodaol")
+                        clickAt(it.first, it.second)
+                        isRunning = false
+                        updateStartIcon(running = false)
+                        cancelScan()
+                    },
+                    onNotFound = {
+                        isScanning = false
+                        if (isRunning) scanHandler.postDelayed(this, scanIntervalMs)
+                    },
+                    onError = {
+                        isRunning = false
+                        updateStartIcon(running = false)
+                        cancelScan()
+                    }
+                )
+            }
+        }
+        scanHandler.post(scanRunnable!!)
+    }
+
+    private fun cancelScan() {
+        delayedStartRunnable?.let { scanHandler.removeCallbacks(it) }
+        delayedStartRunnable = null
+        scanRunnable?.let { scanHandler.removeCallbacks(it) }
+        scanRunnable = null
+        isScanning = false
+    }
+
+    /**
+     * 截一次屏，做一次模板匹配
+     * @return 找到时回调中心点坐标（屏幕坐标）
+     */
+    private fun captureAndMatchOnce(
+        onFound: (Pair<Float, Float>) -> Unit,
+        onNotFound: () -> Unit,
+        onError: () -> Unit
+    ) {
+        if (!hasMediaProjection()) {
+            // 未授权时引导去主界面授权
+            try {
+                val intent = android.content.Intent(this, MainActivity::class.java).apply {
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    putExtra(MainActivity.EXTRA_REQUEST_MEDIA_PROJECTION, true)
+                }
+                startActivity(intent)
+            } catch (_: Exception) {
+            }
+            onError()
+            return
+        }
+
+        takeScreenshot(
+            callback = object : ScreenshotCallback {
+                override fun onScreenshotTaken(bitmap: Bitmap?, searchMapName: String) {
+                    if (bitmap == null) {
+                        onNotFound()
+                        return
+                    }
+
+                    val match = findTemplateOnScreen(bitmap, searchMapName)
+                    if (match != null) {
+                        onFound(match)
+                    } else {
+                        onNotFound()
+                    }
+                }
+
+                override fun onScreenshotError(error: String) {
+                    onError()
+                }
+            },
+            templateName = "template.png"
+        )
+    }
+
+    /**
+     * OpenCV 模板匹配：返回匹配到的中心点（屏幕坐标），否则 null
+     */
+    private fun findTemplateOnScreen(screenBitmap: Bitmap, mapFileName: String): Pair<Float, Float>? {
+        val templateFile = ensureTemplateFile(mapFileName)
+        val templateBitmap = templateFile?.let { android.graphics.BitmapFactory.decodeFile(it.absolutePath) } ?: return null
+
+        val screenMat = Mat()
+        val templMat = Mat()
+        Utils.bitmapToMat(screenBitmap, screenMat)
+        Utils.bitmapToMat(templateBitmap, templMat)
+
+        // 转灰度
+        Imgproc.cvtColor(screenMat, screenMat, Imgproc.COLOR_RGBA2GRAY)
+        Imgproc.cvtColor(templMat, templMat, Imgproc.COLOR_RGBA2GRAY)
+
+        // 模板必须 <= 原图
+        if (templMat.cols() > screenMat.cols() || templMat.rows() > screenMat.rows()) {
+            screenMat.release()
+            templMat.release()
+            return null
+        }
+
+        val resultCols = screenMat.cols() - templMat.cols() + 1
+        val resultRows = screenMat.rows() - templMat.rows() + 1
+        val result = Mat(resultRows, resultCols, CvType.CV_32FC1)
+
+        Imgproc.matchTemplate(screenMat, templMat, result, Imgproc.TM_CCOEFF_NORMED)
+        val mmr = Core.minMaxLoc(result)
+
+        val score = mmr.maxVal
+        val maxLoc = mmr.maxLoc
+
+        screenMat.release()
+        templMat.release()
+        result.release()
+
+        if (score < matchThreshold || maxLoc == null) return null
+
+        val centerX = (maxLoc.x + templateBitmap.width / 2f).toFloat()
+        val centerY = (maxLoc.y + templateBitmap.height / 2f).toFloat()
+        return centerX to centerY
+    }
+
+    /**
+     * 确保模板文件存在于私有目录：
+     * - 优先使用外部私有目录 /files/template.png
+     * - 若不存在则从 assets/template.png 复制
+     * - 支持资产文件为 base64 文本或二进制 PNG
+     */
+    private fun ensureTemplateFile(templateFileName : String): File? {
+        val outDir = getExternalFilesDir(null) ?: filesDir
+        val target = File(outDir, templateFileName)
+        if (target.exists()) return target
+
+        return try {
+            assets.open(templateFileName).use { input ->
+                val bytes = input.readBytes()
+                val content = bytes.toString(Charsets.UTF_8)
+                val decoded: ByteArray = if (content.startsWith("iVBORw0KGgo")) {
+                    // 如果资产文件是 base64 文本，则解码
+                    android.util.Base64.decode(content, android.util.Base64.DEFAULT)
+                } else {
+                    bytes
+                }
+                target.writeBytes(decoded)
+                target
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "无法从 assets 复制模板: ${e.message}")
+            null
+        }
+    }
+
+    private fun clickAt(x: Float, y: Float) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        click(x, y, null)
+    }
+
     private fun finishStart(btnStartPause: ImageButton) {
         isRunning = false
         btnStartPause.postDelayed({
@@ -326,7 +545,7 @@ class AccessibilityControlService : AccessibilityService() {
     }
 
     @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
-    private fun takeScreenshotWithImageReader() {
+    private fun takeScreenshotWithImageReader(templateName: String = "template.png") {
         val projection = mediaProjection
         if (projection == null) {
             screenshotCallback?.onScreenshotError("需要先授予屏幕捕获权限")
@@ -383,7 +602,7 @@ class AccessibilityControlService : AccessibilityService() {
                     if (image != null) {
                         val bitmap = imageToBitmap(image)
                         image.close()
-                        screenshotCallback?.onScreenshotTaken(bitmap)
+                        screenshotCallback?.onScreenshotTaken(bitmap, templateName)
                     } else {
                         screenshotCallback?.onScreenshotError("无法获取图像")
                     }
